@@ -189,7 +189,7 @@ function placeAndClear(board, piece, ox, oy) {
 }
 
 function scoreBoard(board, lines) {
-  // Эвристика: линии + свободные клетки + штраф за дыры в центре.
+  // Локальная эвристика для одношагового сравнения (fallback).
   let empties = 0;
   let centerBusy = 0;
   for (let y = 0; y < 8; y++) {
@@ -199,6 +199,148 @@ function scoreBoard(board, lines) {
     }
   }
   return lines * 120 + empties * 2 - centerBusy;
+}
+
+function countHoles(board) {
+  let holes = 0;
+  for (let y = 1; y < 7; y++) {
+    for (let x = 1; x < 7; x++) {
+      if (board[y][x]) continue;
+      const around = board[y - 1][x] && board[y + 1][x] && board[y][x - 1] && board[y][x + 1];
+      if (around) holes++;
+    }
+  }
+  return holes;
+}
+
+function countBumpiness(board) {
+  const heights = [];
+  for (let x = 0; x < 8; x++) {
+    let h = 0;
+    for (let y = 0; y < 8; y++) {
+      if (board[y][x]) {
+        h = 8 - y;
+        break;
+      }
+    }
+    heights.push(h);
+  }
+
+  let bumpiness = 0;
+  for (let x = 0; x < 7; x++) bumpiness += Math.abs(heights[x] - heights[x + 1]);
+  return bumpiness;
+}
+
+function countEdgeWeight(board) {
+  let edgeFill = 0;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      if (!board[y][x]) continue;
+      if (x === 0 || x === 7 || y === 0 || y === 7) edgeFill++;
+    }
+  }
+  return edgeFill;
+}
+
+function fillRatio(board) {
+  let filled = 0;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) if (board[y][x]) filled++;
+  }
+  return filled / 64;
+}
+
+function evaluateBoard(board, totalLines, comboStreak) {
+  const holes = countHoles(board);
+  const bumpiness = countBumpiness(board);
+  const edgeFill = countEdgeWeight(board);
+  const empties = 64 - Math.floor(fillRatio(board) * 64);
+
+  // Режим выживания: при заполнении >60% сильнее ценим очистки.
+  const survivalMode = fillRatio(board) > 0.6;
+  const lineWeight = survivalMode ? 240 : 150;
+  const comboWeight = survivalMode ? 45 : 70;
+
+  return (
+    totalLines * lineWeight +
+    comboStreak * comboWeight +
+    empties * 2 +
+    edgeFill * 3 -
+    holes * 80 -
+    bumpiness * 6
+  );
+}
+
+function getPermutations(items) {
+  if (items.length <= 1) return [items.slice()];
+  const result = [];
+  for (let i = 0; i < items.length; i++) {
+    const head = items[i];
+    const rest = items.slice(0, i).concat(items.slice(i + 1));
+    for (const tail of getPermutations(rest)) result.push([head].concat(tail));
+  }
+  return result;
+}
+
+function getPossibleMoves(board, piece) {
+  const moves = [];
+  if (!piece) return moves;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      if (!canPlace(board, piece, x, y)) continue;
+      const sim = placeAndClear(board, piece, x, y);
+      moves.push({ x, y, nextBoard: sim.board, lines: sim.lines });
+    }
+  }
+  return moves;
+}
+
+function bestThreePiecePlan(board, pieces) {
+  const validIndexes = [];
+  for (let i = 0; i < pieces.length; i++) if (pieces[i]) validIndexes.push(i);
+  if (!validIndexes.length) return null;
+
+  const permutations = getPermutations(validIndexes);
+  let bestPlan = null;
+  let bestScore = -Infinity;
+
+  for (const order of permutations) {
+    const initialState = {
+      board,
+      totalLines: 0,
+      comboStreak: 0,
+      sequence: [],
+    };
+    let states = [initialState];
+
+    for (const idx of order) {
+      const nextStates = [];
+      for (const st of states) {
+        const moves = getPossibleMoves(st.board, pieces[idx]);
+        for (const mv of moves) {
+          const comboStreak = mv.lines > 0 ? st.comboStreak + 1 : 0;
+          nextStates.push({
+            board: mv.nextBoard,
+            totalLines: st.totalLines + mv.lines,
+            comboStreak,
+            sequence: st.sequence.concat([{ pieceIndex: idx, x: mv.x, y: mv.y, lines: mv.lines }]),
+          });
+        }
+      }
+      states = nextStates;
+      if (!states.length) break;
+    }
+
+    for (const st of states) {
+      const value = evaluateBoard(st.board, st.totalLines, st.comboStreak);
+      if (value > bestScore) {
+        bestScore = value;
+        bestPlan = { score: value, sequence: st.sequence };
+      }
+    }
+  }
+
+  return bestPlan;
 }
 
 function bestMove(board, piece) {
@@ -257,13 +399,25 @@ function mainLoop() {
       continue;
     }
 
-    // Жадная стратегия: берем лучший из 3 доступных текущих ходов.
+    // Планирование по всей тройке фигур (все перестановки + симуляция).
+    const plan = bestThreePiecePlan(board, pieces);
+
     let chosen = null;
-    for (let i = 0; i < 3; i++) {
-      const mv = bestMove(board, pieces[i]);
-      if (!mv) continue;
-      if (!chosen || mv.score > chosen.move.score) {
-        chosen = { index: i, move: mv };
+    if (plan && plan.sequence.length) {
+      chosen = {
+        index: plan.sequence[0].pieceIndex,
+        move: { x: plan.sequence[0].x, y: plan.sequence[0].y },
+      };
+    }
+
+    // fallback к одношаговой жадной стратегии, если план не найден.
+    if (!chosen) {
+      for (let i = 0; i < 3; i++) {
+        const mv = bestMove(board, pieces[i]);
+        if (!mv) continue;
+        if (!chosen || mv.score > chosen.move.score) {
+          chosen = { index: i, move: mv };
+        }
       }
     }
 
